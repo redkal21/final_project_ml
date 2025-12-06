@@ -1,0 +1,115 @@
+---
+title: "Diabetes"
+author: "RAFA"
+date: "2025-12-04"
+output: html_document
+---
+
+
+```{r}
+#get data
+
+Diabetes
+
+str(Diabetes)
+
+
+summary(Diabetes)
+
+library(dplyr)
+library(tidyverse)
+
+
+#we check to see if the distrbution of NAS is even throughout every part of the data
+#if there is a large disparity like for examppe is some are missing much more of their proportions than others #then we may have to do some imputation or something bc we may not be able to justify simpling dropping all of our NAS
+
+
+#this shows whether any column has a disproportionate amount of missing values.
+na_dist_cols <- Diabetes %>% 
+  summarise(across(everything(), ~mean(is.na(.)) * 100)) %>% 
+  pivot_longer(everything(), names_to="variable", values_to="pct_missing") %>%
+  arrange(desc(pct_missing))
+
+
+#we see each variable is missing about 10% of its values
+
+
+#this shows whether any row has a disproportionate amount of missing values.
+Rowcheck<-Diabetes %>%
+  mutate(n_missing = rowSums(is.na(.)),
+         pct_missing = n_missing / ncol(Diabetes) * 100) %>%
+  count(pct_missing) %>%
+  arrange(desc(pct_missing)) 
+
+#does this mean we can justify dropping rows missing more than 35% of their data? this is like 190 samples
+
+#maybe then we can populate the other values with the averages of each column
+
+
+
+
+#we need to check if the distribution of missing values is matches the distribution of the data for that column
+
+library(tidyverse)
+
+numeric_vars <- Diabetes %>% select(where(is.numeric)) %>% names()
+
+check_dist_deviation <- function(df, var, all_vars, alpha = 0.05) {
+  
+  miss_ind <- is.na(df[[var]])
+  
+  # cannot test if no missing or fully missing
+  if (all(!miss_ind) || all(miss_ind)) {
+    return(tibble(variable = var, deviates = FALSE, min_p = NA_real_))
+  }
+  
+  other_vars <- setdiff(all_vars, var)
+  
+  pvals <- map_dbl(other_vars, function(o) {
+    x_obs  <- df[[o]][!miss_ind]     # distribution when var IS observed
+    x_miss <- df[[o]][miss_ind]      # distribution when var IS missing
+    
+    # require at least 2 unique points in each distribution
+    if (length(x_obs) < 5 || length(x_miss) < 5) return(NA_real_)
+    
+    ks <- suppressWarnings(ks.test(x_obs, x_miss))
+    ks$p.value
+  })
+  
+  min_p <- min(pvals, na.rm = TRUE)
+  
+  tibble(
+    variable = var,
+    deviates = min_p < alpha,
+    min_p = min_p
+  )
+}
+
+distribution_results <- map_dfr(
+  numeric_vars,
+  ~check_dist_deviation(Diabetes, .x, numeric_vars)
+)
+
+
+#we see that the distributoon of NAS matches the distrubution of the data for each column
+distribution_results
+
+
+library(reticulate)
+
+```
+
+
+
+```{python}
+
+py_install("pandas", pip=TRUE)
+
+pip install pandas
+
+import pandas as pd
+
+Var = pd.read_csv("/Users/rafa/Desktop/PhD/MAchine Learning/FinalProj/Diabetes.csv")
+
+```
+
