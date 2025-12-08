@@ -1,0 +1,271 @@
+---
+title: "Diabetes"
+author: "RAFA"
+date: "2025-12-04"
+output: html_document
+---
+
+
+```{r}
+#get data
+
+Diabetes <- read.csv("Diabetes.csv")
+str(Diabetes)
+
+
+summary(Diabetes)
+
+library(dplyr)
+library(tidyverse)
+library(cluster)
+library(ggplot2)
+library(reshape2)
+
+
+#we check to see if the distrbution of NAS is even throughout every part of the data
+#if there is a large disparity like for examppe is some are missing much more of their proportions than others #then we may have to do some imputation or something bc we may not be able to justify simpling dropping all of our NAS
+
+
+#this shows whether any column has a disproportionate amount of missing values.
+na_dist_cols <- Diabetes %>% 
+  summarise(across(everything(), ~mean(is.na(.)) * 100)) %>% 
+  pivot_longer(everything(), names_to="variable", values_to="pct_missing") %>%
+  arrange(desc(pct_missing))
+
+
+#we see each variable is missing about 10% of its values
+
+
+#this shows whether any row has a disproportionate amount of missing values.
+Rowcheck<-Diabetes %>%
+  mutate(n_missing = rowSums(is.na(.)),
+         pct_missing = n_missing / ncol(Diabetes) * 100) %>%
+  count(pct_missing) %>%
+  arrange(desc(pct_missing)) 
+
+#does this mean we can justify dropping rows missing more than 35% of their data? this is like 190 samples
+
+#maybe then we can populate the other values with the averages of each column
+
+
+
+
+#we need to check if the distribution of missing values is matches the distribution of the data for that column
+
+library(tidyverse)
+
+numeric_vars <- Diabetes %>% select(where(is.numeric)) %>% names()
+
+check_dist_deviation <- function(df, var, all_vars, alpha = 0.05) {
+  
+  miss_ind <- is.na(df[[var]])
+  
+  # cannot test if no missing or fully missing
+  if (all(!miss_ind) || all(miss_ind)) {
+    return(tibble(variable = var, deviates = FALSE, min_p = NA_real_))
+  }
+  
+  other_vars <- setdiff(all_vars, var)
+  
+  pvals <- map_dbl(other_vars, function(o) {
+    x_obs  <- df[[o]][!miss_ind]     # distribution when var IS observed
+    x_miss <- df[[o]][miss_ind]      # distribution when var IS missing
+    
+    # require at least 2 unique points in each distribution
+    if (length(x_obs) < 5 || length(x_miss) < 5) return(NA_real_)
+    
+    ks <- suppressWarnings(ks.test(x_obs, x_miss))
+    ks$p.value
+  })
+  
+  min_p <- min(pvals, na.rm = TRUE)
+  
+  tibble(
+    variable = var,
+    deviates = min_p < alpha,
+    min_p = min_p
+  )
+}
+
+distribution_results <- map_dfr(
+  numeric_vars,
+  ~check_dist_deviation(Diabetes, .x, numeric_vars)
+)
+
+
+#we see that the distributoon of NAS matches the distrubution of the data for each column
+distribution_results
+
+
+```
+```
+
+
+
+
+Imputing
+Ok so we can impute from mean, median, or mode but which makes sense to use?
+Well Are the distributions of all of our variables normally distributed because if they are not normally distributed then imputing could introduce error in parts of the distribution that happen to have higher density of NA’s that will be filled by our imputed values. Regardless, I think if the true values for these imputed points are in truth outliers or near the extremes of an approximately normal distribution, then we lose what could be very important data for modelling or interpretation as we send these observations towards the mean, median, mode etc. But what else can we do?
+
+Perhaps We can impute based on inferred covariance???? Like if we look at all our terms and see that column x covaries lets say about 1:1 with column z, then we should be able to impute based off the distribution of column z values we can project onto the curve of the column x value
+Like we predict the missing x value by projecting onto the covariance curve for that row’s corresponding z value
+
+
+So like if we see that bmi covaries strongly with self reported physical activity score 
+Then we use the reported activity of the person with missing values to predict the bmi 
+This is probably not very useful as a metric bc bmi is more complicated that this but for imputation i think basing it off covariance curves is a solid bet.
+
+We just need to test for covariance among all the relationships
+
+
+```{r}
+library(tidyverse)
+
+# Select numeric columns only
+num_df <- Diabetes %>% select(where(is.numeric))
+
+# Compute correlation matrix
+cor_mat <- cor(num_df, use = "pairwise.complete.obs")
+
+# Convert to a long dataframe
+cor_df <- as.data.frame(as.table(cor_mat)) %>%
+  rename(var1 = Var1, var2 = Var2, correlation = Freq)
+
+# Remove self correlations and duplicates (var1 = var2)
+#something doesnt feel right here
+cor_df_clean <- cor_df %>%
+  filter(var1 != var2) %>%
+  group_by(pair = paste(pmin(var1, var2), pmax(var1, var2), sep = "_")) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-pair)
+  
+
+```
+#we see nothing has strong enough covariances to impute with reasonable justififcation
+
+- randforest imputation not a good fit - too many weak correlations
+
+```{r}
+install.packages("mice")
+library(mice)
+
+#mice imputation
+vars_w_nas <- names(Diabetes)[colSums(is.na(Diabetes)) > 0]
+vars_w_nas 
+init_mice <- mice(Diabetes[vars_w_nas], maxit=0)
+meth <- init_mice$method
+pred <- init_mice$predictorMatrix
+
+
+set.seed(123)
+mice_imp <- mice(Diabetes[vars_w_nas], method=meth, predictorMatrix=pred, m=5, maxit=50, printFlag=TRUE, seed=123)
+summary(mice_imp)
+
+#runtime is too long for imputation with maxit=50; in future executions, note to self, change maxit to 20; sufficient for convergence for large dataset 
+```
+
+
+```{r}
+#save csv with individual dataset from mice imputation
+
+
+
+
+```
+
+
+
+```{r}
+imputed_data <- complete(mice_imp, 1)  # Extract the first imputed dataset
+head(imputed_data)  # Explore the completed dataset
+
+
+
+pca_data <- imputed_data %>%
+            select(where(is.numeric))  # Optionally filter out binary variables too
+
+#Standardize data for PCA
+pca_data_scaled <- scale(pca_data)
+
+
+pca_result <- prcomp(pca_data_scaled, center = TRUE, scale. = FALSE)  # Already scaled
+
+summary(pca_result)        # Variance explained
+
+```
+
+
+
+
+```{r}
+#scree plot
+install.packages("factoextra")
+install.packages("ggplot2")
+library(ggplot2)
+library(factoextra)
+scree_plt <- fviz_eig(pca_result, addlabels = TRUE, title = "Scree Plot",
+         ylim = c(0, 40))
+
+#save output as png
+ggsave("scree_plot.png", plot = scree_plt, width = 8, height = 6, dpi = 300)
+
+
+
+        
+```
+
+
+```{r}
+#umap
+install.packages("umap")
+
+library(umap)
+# Apply UMAP (reduce dimensions to 2D)
+umap_result <- umap(pca_data_scaled)
+
+# Extract the embedding (2D coordinates)
+umap_embedding <- as.data.frame(umap_result$layout)
+
+# Add labels if available (e.g., clusters or groups)
+umap_embedding$label <- imputed_data$HighBP  # Example binary column
+
+# Visualize UMAP graph
+umap_plt <- ggplot(umap_embedding, aes(x = V1, y = V2, color = label)) +
+  geom_point(size = 1.5) +
+  labs(title = "UMAP Visualization", x = "UMAP Dimension 1", y = "UMAP Dimension 2") +
+  theme_minimal()
+  
+#save as png
+ggsave("umap_plot.png", plot = umap_plt, width = 8, height = 6, dpi = 300)
+
+```
+
+
+
+VARIABLE DATATYPE LAYOUT
+
+binary_vars <- c(
+  "HighBP","HighChol","CholCheck","Smoker","Stroke","HeartDiseaseorAttack",
+  "PhysActivity","Fruits","Veggies","HvyAlcoholConsump","AnyHealthcare",
+  "NoDocbcCost","DiffWalk","Sex","Diabetes_binary"
+)
+#detect variables with categorial values (cutoff- equal to or less than 8 categories), convert these columns to factors, combine with train to convert --these were coded as integers, but are discrete values
+# Ordered (ordinal) variables (Likert/age/education/income scales)
+ordered_vars <- c(
+  "GenHlth",     # 1-5: health rating (ordered)
+  "Age",         # 13-level age category (ordered)
+  "Education",   # 1-6 education level (ordered)
+  "Income"       # 1-8 income bracket (ordered)
+)
+
+# Numeric (continuous / count) variables to keep numeric
+numeric_vars <- c(
+  "BMI",         # Body Mass Index numeric
+  "MentHlth",    # days 0-30
+  "PhysHlth"     # days 0-30
+)
+
+
+
+
