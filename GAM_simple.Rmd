@@ -1,0 +1,52 @@
+---
+title: "GAM Simple"
+output: html_document
+date: "2025-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```
+```{r}
+setwd("/scratch/nh2696/Machine_Learning/")
+Diabetes_file_w_outcomes <- c("diabetes_masked - Copy.csv")
+
+Diabetes_outcomes_df<-Diabetes_file_w_outcomes %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows() 
+
+outcome_var<-c("Diabetes_binary") #binary so 0 and 1
+
+outcome_df <- Diabetes_outcomes_df[, outcome_var]
+```
+
+```{r}
+Diabetes_imputed_w_outcomes_df=cbind(Diabetes_df,outcome_df)
+names(Diabetes_imputed_w_outcomes_df)[names(Diabetes_imputed_w_outcomes_df) == "outcome_df"] <- "Diabetes_binary"
+```
+
+```{r}
+outcome <- "Diabetes_binary"
+svi_var <- "SVI_scaled"
+
+# Other covariates
+covariates <- c("HighBP", "HighChol", "CholCheck", "BMI", "Smoker",
+                "Stroke", "HeartDiseaseorAttack", "PhysActivity",
+                "Fruits", "Veggies", "HvyAlcoholConsump", "GenHlth",
+                "MentHlth", "PhysHlth", "DiffWalk",
+                "Sex", "Age")
+
+
+formula_str <- paste(outcome, "~", svi_var, "+", paste(covariates, collapse = " + "))
+
+gam_model <- gam(as.formula(formula_str),
+                 family = binomial(),
+                 data = Diabetes_imputed_w_outcomes_df)
+
+
+summary(gam_model)
+
+Diabetes_df$predicted_prob <- predict(gam_model, type = "response")
+```
