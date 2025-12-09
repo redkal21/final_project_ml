@@ -1,0 +1,476 @@
+---
+title: "GAM Simple"
+output: html_document
+date: "2025-12-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("/scratch/nh2696/Machine_Learning/")
+library(dplyr)
+library(readr)
+one_file <- c("Diabetes_imputed_dataset_1.csv")
+
+Diabetes_df<-one_file %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows() 
+```
+
+```{r}
+library(mgcv)
+library(dplyr)
+library(PCAmixdata)
+library(ggplot2)
+library(tidyr)
+
+cont_var<-c("Education","Income") #range from 1 to 6 and 1 to 8, respectively
+cat_var<-c("NoDocbcCost","AnyHealthcare") #binary so 0 and 1
+
+cont_df <- Diabetes_df[, cont_var]
+cat_df  <- Diabetes_df[, cat_var] %>% mutate(across(everything(), as.factor)) #for PCAmix, they must be made into factors
+
+spline_list <- vector("list", length = ncol(cont_df))
+
+for (i in seq_len(ncol(cont_df))) { #for each continuous variables
+  x<-cont_df[[i]]
+  spline_basis<-smoothCon(s(x, k = 5), data = data.frame(x = x), knots = NULL)[[1]]$X #use smoothCon to make 5 spline basis for the variable being looped through
+  spline_list[[i]]<-spline_basis 
+}
+
+X_spline <- do.call(cbind, spline_list) #spline lists as a matrix
+
+col_has_var_index=logical(ncol(X_spline))
+for (i in seq_len(ncol(X_spline))) {
+  if (sd(as.numeric(X_spline[, i])) > 0) {
+    col_has_var_index[i] <- TRUE
+  } 
+  else {
+    col_has_var_index[i] <- FALSE
+  }
+}
+
+X_spline <- X_spline[, col_has_var_index] #only include columns in the spline matrix that are not constant
+
+spline_df <- as.data.frame(X_spline)
+
+spline_colnames <- c()
+index <- 1
+
+#Need to name only columns that are not constant
+for (i in seq_along(spline_list)){
+  n_cols<-ncol(spline_list[[i]])
+  end<-index + n_cols - 1
+  cols_w_var<-which(col_has_var_index[index:end])
+  if (length(cols_w_var) > 0){
+    spline_colnames <- c(spline_colnames, paste0(cont_var[i], "_spline", cols_w_var))
+  }
+  index<-end + 1
+}
+colnames(spline_df)<-spline_colnames
+
+#PCAmix can use both categorical and continuous variables
+res<-PCAmix(X.quanti = spline_df, X.quali = cat_df, rename.level = TRUE, ndim = 5)
+
+#SVI is the first principal component
+Diabetes_df$SVI <- res$ind$coord[,1] #extracts PC1 for each observation
+
+Diabetes_df$SVI_scaled<-(Diabetes_df$SVI-min(Diabetes_df$SVI))/(max(Diabetes_df$SVI)-min(Diabetes_df$SVI)) #scales SVI between 0 and 1
+
+summary(Diabetes_df$SVI_scaled)
+hist(Diabetes_df$SVI_scaled, main="SVI from PC1 (no interactions)", xlab="SVI (scaled)")
+```
+```{r}
+#Pairwise comparison (education and income)
+#Continuous by continuous pairwise (spline bases)
+interaction_list<-list()
+for (i in 1:(length(cont_var)-1)) {
+  for (j in (i+1):length(cont_var)) {
+    mat1 <- spline_list[[i]][, col_has_var_index[sum(sapply(spline_list[1:i], ncol)) - ncol(spline_list[[i]]) + 1 : ncol(spline_list[[i]])], drop=FALSE]
+    mat2 <- spline_list[[j]][, col_has_var_index[sum(sapply(spline_list[1:j], ncol)) - ncol(spline_list[[j]]) + 1 : ncol(spline_list[[j]])], drop=FALSE]
+    for (c1 in 1:ncol(mat1)) {
+      for (c2 in 1:ncol(mat2)) {
+        interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2])]] <- mat1[, c1] * mat2[, c2]
+      }
+    }
+  }
+}
+
+X_interactions<-do.call(cbind, interaction_list)
+
+#Combine spline main effects and interaction terms
+X_quanti_full<-cbind(spline_df, as.data.frame(X_interactions))
+
+res <- PCAmix(X.quanti = X_quanti_full, X.quali = cat_df, rename.level = TRUE, ndim = 5)
+
+#PC1
+Diabetes_df$SVI <- res$ind$coord[,1]
+
+#Rescale
+Diabetes_df$SVI_scaled <- (Diabetes_df$SVI-min(Diabetes_df$SVI))/(max(Diabetes_df$SVI)-min(Diabetes_df$SVI))
+
+summary(Diabetes_df$SVI_scaled)
+hist(Diabetes_df$SVI_scaled, main="SVI from PC1 (with education-income interaction)", xlab="SVI (scaled)")
+
+```
+
+```{r}
+#All possible interactions
+interaction_list <- list()
+
+#Continuous by continuous pairwise (spline bases), Pairwise 1
+if(length(cont_var) > 1){
+  for(i in 1:(length(cont_var)-1)){
+    for(j in (i+1):length(cont_var)){
+      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df))]
+      for(c1 in 1:ncol(mat1)){
+        for(c2 in 1:ncol(mat2)){
+          interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2])]] <- mat1[, c1] * mat2[, c2]
+        }
+      }
+    }
+  }
+}
+
+#Continuous by categorical pairwise, Pairwise 2
+for(i in seq_along(cont_var)){
+  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+  for(j in seq_along(cat_var)){
+    cat_numeric <- as.numeric(cat_df[[j]])
+    for(c in 1:ncol(mat)){
+      interaction_list[[paste0(colnames(mat)[c], "_x_", cat_var[j])]] <- mat[, c] * cat_numeric
+    }
+  }
+}
+
+#Categorical by categorical pairwise, Pairwise 3
+if(length(cat_var) > 1){
+  for(i in 1:(length(cat_var)-1)){
+    for(j in (i+1):length(cat_var)){
+      interaction_list[[paste0(cat_var[i], "_x_", cat_var[j])]] <- as.numeric(cat_df[[i]]) * as.numeric(cat_df[[j]])
+    }
+  }
+}
+
+#Continuous by continuous by categorical three-way comp 1
+if(length(cont_var) > 1 & length(cat_var) >= 1){
+  for(i in 1:(length(cont_var)-1)){
+    for(j in (i+1):length(cont_var)){
+      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df))]
+      for(k in seq_along(cat_var)){
+        cat_numeric <- as.numeric(cat_df[[k]])
+        for(c1 in 1:ncol(mat1)){
+          for(c2 in 1:ncol(mat2)){
+            interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2], "_x_", cat_var[k])]] <- mat1[, c1] * mat2[, c2] * cat_numeric
+          }
+        }
+      }
+    }
+  }
+}
+
+#Continuous by categorical by categorical three-way comp 2
+for(i in seq_along(cont_var)){
+  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+  for(j in 1:(length(cat_var)-1)){
+    for(k in (j+1):length(cat_var)){
+      cat_num1 <- as.numeric(cat_df[[j]])
+      cat_num2 <- as.numeric(cat_df[[k]])
+      for(c in 1:ncol(mat)){
+        interaction_list[[paste0(colnames(mat)[c], "_x_", cat_var[j], "_x_", cat_var[k])]] <- mat[, c] * cat_num1 * cat_num2
+      }
+    }
+  }
+}
+
+
+#All variables (categorical by categorical by continuous by continuous four-way)
+if(length(cont_var) == 2 & length(cat_var) == 2){
+  mat1 <- spline_df[, grep(paste0("^", cont_var[1], "_spline"), colnames(spline_df))]
+  mat2 <- spline_df[, grep(paste0("^", cont_var[2], "_spline"), colnames(spline_df))]
+  cat_num1 <- as.numeric(cat_df[[1]])
+  cat_num2 <- as.numeric(cat_df[[2]])
+  for(c1 in 1:ncol(mat1)){
+    for(c2 in 1:ncol(mat2)){
+      interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2], "_x_", cat_var[1], "_x_", cat_var[2])]] <- mat1[, c1] * mat2[, c2] * cat_num1 * cat_num2
+    }
+  }
+}
+
+X_interactions <- as.data.frame(interaction_list)
+
+#Main spline and all interactions
+X_quanti_full <- cbind(spline_df, X_interactions)
+
+res <- PCAmix(X.quanti = X_quanti_full,
+              X.quali = cat_df,
+              rename.level = TRUE,
+              ndim = 5)
+
+#PC1
+Diabetes_df$SVI<-res$ind$coord[,1]
+
+#Rescale
+Diabetes_df$SVI_scaled<-(Diabetes_df$SVI-min(Diabetes_df$SVI))/(max(Diabetes_df$SVI)-min(Diabetes_df$SVI))
+
+summary(Diabetes_df$SVI_scaled)
+hist(Diabetes_df$SVI_scaled, main="SVI with all interactions", xlab="SVI (scaled)")
+
+```
+
+
+```{r}
+setwd("/scratch/nh2696/Machine_Learning/")
+Diabetes_file_w_outcomes <- c("diabetes_masked - Copy.csv")
+
+Diabetes_outcomes_df<-Diabetes_file_w_outcomes %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows() 
+
+outcome_var<-c("Diabetes_binary") #binary so 0 and 1
+
+outcome_df <- Diabetes_outcomes_df[, outcome_var]
+```
+
+```{r}
+```
+
+
+```{r}
+Diabetes_imputed_w_outcomes_df=cbind(Diabetes_df,outcome_df)
+names(Diabetes_imputed_w_outcomes_df)[names(Diabetes_imputed_w_outcomes_df) == "outcome_df"] <- "Diabetes_binary"
+```
+
+```{r}
+```
+
+
+```{r}
+outcome <- "Diabetes_binary"
+svi_var <- "SVI_scaled"
+
+# Other covariates
+covariates <- c("HighBP", "HighChol", "CholCheck", "BMI", "Smoker",
+                "Stroke", "HeartDiseaseorAttack", "PhysActivity",
+                "Fruits", "Veggies", "HvyAlcoholConsump", "GenHlth",
+                "MentHlth", "PhysHlth", "DiffWalk",
+                "Sex", "Age")
+
+
+formula_str <- paste(outcome, "~", svi_var, "+", paste(covariates, collapse = " + "))
+
+gam_model <- gam(as.formula(formula_str),
+                 family = binomial(),
+                 data = Diabetes_imputed_w_outcomes_df)
+
+
+summary(gam_model)
+
+Diabetes_df$predicted_prob <- predict(gam_model, type = "response")
+```
+
+```{r}
+```
+
+
+```{r}
+# Assume Diabetes_imputed_w_outcomes_df has all covariates + outcome
+df <- Diabetes_imputed_w_outcomes_df
+```
+
+
+```{r}
+```
+
+
+```{r}
+# Ensure binary outcome is 0/1
+df[[outcome]] <- as.numeric(df[[outcome]] == 1)
+```
+
+
+```{r}
+```
+
+
+```{r}
+# Select covariates for interaction exploration
+main_vars <- c(svi_var, covariates)
+```
+```
+
+```{r}
+```{r}
+
+# Robust bam() pipeline using SVI as linear + per-variable safe splines + pairwise continuous interactions
+library(mgcv)
+library(dplyr)
+
+# ---- User inputs ----
+df <- Diabetes_imputed_w_outcomes_df   # your dataframe (must contain Diabetes_binary & SVI_scaled etc)
+outcome     <- "Diabetes_binary"       # 0/1 outcome name
+svi_var     <- "SVI_scaled"            # SVI included as linear term
+
+# Continuous covariates (exclude Education/Income since you replace them with SVI)
+cont_var <- c("BMI", "Age", "PhysHlth", "MentHlth", "GenHlth")
+
+# Categorical covariates (keep as factors / parametric)
+cat_var <- c("HighBP", "HighChol", "CholCheck", "Smoker",
+             "Stroke", "HeartDiseaseorAttack", "PhysActivity",
+             "Fruits", "Veggies", "HvyAlcoholConsump",
+             "DiffWalk", "Sex")
+
+max_k_requested <- 5   # desired upper bound for spline basis dimension
+nthreads <- 14         # HPC cores to use for bam()
+
+# ---- Basic checks and conversions ----
+# Ensure data frame present
+if (!exists("df")) stop("Data frame 'df' not found. Set df <- Diabetes_imputed_w_outcomes_df")
+
+# Ensure outcome is 0/1 numeric
+if (!is.numeric(df[[outcome]])) {
+  df[[outcome]] <- as.numeric(as.character(df[[outcome]]))
+}
+# If values are not 0/1, convert logical/YesNo -> 0/1
+unique_out <- sort(unique(na.omit(df[[outcome]])))
+if (!all(unique_out %in% c(0,1))) {
+  # try coerce logical or "Yes"/"No"
+  if (all(unique_out %in% c(0,1,NA))) {
+    # ok
+  } else {
+    # attempt common conversions
+    df[[outcome]] <- ifelse(tolower(as.character(df[[outcome]])) %in% c("yes","y","1","true","t"), 1,
+                            ifelse(tolower(as.character(df[[outcome]])) %in% c("no","n","0","false","f"), 0, NA))
+  }
+}
+
+# Force categorical variables to factor
+for (v in cat_var) {
+  if (!v %in% names(df)) stop(paste0("Categorical variable '", v, "' not found in df"))
+  df[[v]] <- as.factor(df[[v]])
+}
+
+# Check continuous vars existence and decide whether to treat as continuous or factor
+cont_var_safe <- c()
+binary_from_cont <- c()
+var_k <- list()
+
+for (v in cont_var) {
+  if (!v %in% names(df)) stop(paste0("Continuous variable '", v, "' not found in df"))
+  x <- df[[v]]
+  nuniq <- length(unique(na.omit(x)))
+  # If variable has <= 2 unique values => treat as factor (move to cat_var)
+  if (nuniq <= 2) {
+    cat_var <- union(cat_var, v)
+    binary_from_cont <- c(binary_from_cont, v)
+  } else {
+    # Choose k safely: at most nuniq - 1 and at most max_k_requested
+    k_safe <- min(max_k_requested, max(3, nuniq - 1))  # ensure k >= 3 for a meaningful spline (adjustable)
+    cont_var_safe <- c(cont_var_safe, v)
+    var_k[[v]] <- k_safe
+  }
+}
+
+# Inform the user
+cat("Continuous vars to use with splines (and chosen k):\n")
+print(var_k)
+if (length(binary_from_cont) > 0) {
+  cat("The following 'continuous' vars had <= 2 unique values and will be treated as factors:", paste(binary_from_cont, collapse=", "), "\n")
+}
+
+# Rebuild cat_var to include those detected as binary
+cat_var <- unique(cat_var)
+
+# ---- Build formula components ----
+terms_list <- character(0)
+
+# SVI as linear
+if (!svi_var %in% names(df)) stop("SVI variable not found in df")
+terms_list <- c(terms_list, svi_var)
+
+# Add spline main effects for continuous safe vars
+for (v in cont_var_safe) {
+  k_v <- var_k[[v]]
+  terms_list <- c(terms_list, paste0("s(", v, ", k=", k_v, ")"))
+}
+
+# Add categorical main effects (parametric factors)
+terms_list <- c(terms_list, cat_var)
+
+# Build pairwise continuous x continuous tensor interactions
+interaction_terms_cc <- character(0)
+if (length(cont_var_safe) > 1) {
+  for (i in seq_len(length(cont_var_safe)-1)) {
+    for (j in seq((i+1), length(cont_var_safe))) {
+      v1 <- cont_var_safe[i]; v2 <- cont_var_safe[j]
+      k1 <- var_k[[v1]]; k2 <- var_k[[v2]]
+      # Use ti() with explicit k vector c(k1,k2)
+      # specify k as "k=c(k1,k2)" inside call
+      interaction_terms_cc <- c(interaction_terms_cc,
+                                paste0("ti(", v1, ",", v2, ", k = c(", k1, ",", k2, "))"))
+    }
+  }
+}
+
+# Optionally add continuous x categorical interactions using s(..., by=factor)
+interaction_terms_cg <- character(0)
+for (v in cont_var_safe) {
+  for (f in cat_var) {
+    # only sensible if factor has >1 level
+    if (nlevels(df[[f]]) > 1) {
+      k_v <- var_k[[v]]
+      interaction_terms_cg <- c(interaction_terms_cg, paste0("s(", v, ", by=", f, ", k=", k_v, ")"))
+    }
+  }
+}
+
+# (Skip categorical x categorical interactions as parametric ":" unless specifically wanted)
+# Combine all terms
+all_terms <- c(terms_list, interaction_terms_cc, interaction_terms_cg)
+
+# Construct formula
+formula_str <- paste0(outcome, " ~ ", paste(all_terms, collapse = " + "))
+cat("Final formula (preview):\n")
+cat(formula_str, "\n\n")
+
+# ---- Fit bam() ----
+# Use discrete=TRUE for large data; set nthreads from user input
+# We wrap fit in tryCatch to present any mgcv errors clearly
+fit_result <- tryCatch({
+  bam_fit <- bam(as.formula(formula_str),
+                 data = df,
+                 family = binomial(),
+                 discrete = TRUE,
+                 nthreads = nthreads,
+                 select = TRUE,
+                 method = "fREML")   # fREML often fast & robust
+  bam_fit
+}, error = function(e) {
+  message("bam() failed with error:\n", e$message)
+  stop(e)
+})
+
+# ---- Post-fit reporting ----
+print(summary(fit_result))
+
+# Predict probabilities (on df)
+df$predicted_prob_bam <- predict(fit_result, newdata = df, type = "response")
+
+# Basic evaluation on training data
+if (!all(is.na(df[[outcome]]))) {
+  library(pROC)
+  roc_obj <- roc(df[[outcome]], df$predicted_prob_bam, direction = "<")
+  cat("AUC on training data:", round(auc(roc_obj), 3), "\n")
+}
+
+# Save fit object to workspace
+bam_model <- fit_result
+
+# End
+
+```
+
