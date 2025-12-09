@@ -5,147 +5,136 @@ date: "2025-12-04"
 output: html_document
 ---
 
-
 ```{r}
-#get data
 
-Diabetes
+#In this chunk, we load the Diabetes dataset and explore it using str() and summary(). This helps us understand the structure of the data, the types of variables, and get an initial sense of missing values or unusual patterns. We also load dplyr and tidyverse for data manipulation.
 
-str(Diabetes)
+Diabetes # Quick look at raw dataset
 
+str(Diabetes) # Shows structure: number of rows, columns, and variable types
 
-summary(Diabetes)
+summary(Diabetes) # Summary statistics
 
+# Load libraries
 library(dplyr)
 library(tidyverse)
 
+# we explore the missing values in our dataset.
+# We check missingness by column, missingness by row, and whether the missingness
+# appears random or follows a pattern. This helps us decide whether imputation is safe.
 
-#we check to see if the distrbution of NAS is even throughout every part of the data
-#if there is a large disparity like for examppe is some are missing much more of their proportions than others #then we may have to do some imputation or something bc we may not be able to justify simpling dropping all of our NAS
+# ---- Missingness by column ----
+# Here we calculate the percentage of missing values for each variable.
+# This helps us identify columns with high missingness.
 
-
-#this shows whether any column has a disproportionate amount of missing values.
 na_dist_cols <- Diabetes %>% 
   summarise(across(everything(), ~mean(is.na(.)) * 100)) %>% 
   pivot_longer(everything(), names_to="variable", values_to="pct_missing") %>%
   arrange(desc(pct_missing))
 
+na_dist_cols   # View missing % for each column
+
 
 #we see each variable is missing about 10% of its values
 
+# ---- Missingness by row ----
+# Check how many values are missing per row.
+# This identifies individuals who may be missing too much data.
 
-#this shows whether any row has a disproportionate amount of missing values.
 Rowcheck<-Diabetes %>%
-  mutate(n_missing = rowSums(is.na(.)),
-         pct_missing = n_missing / ncol(Diabetes) * 100) %>%
+  mutate(n_missing = rowSums(is.na(.)), # number of missing values in row
+         pct_missing = n_missing / ncol(Diabetes) * 100) %>% # percent missing in that row
   count(pct_missing) %>%
   arrange(desc(pct_missing)) 
 
-#does this mean we can justify dropping rows missing more than 35% of their data? this is like 190 samples
-
-#maybe then we can populate the other values with the averages of each column
+Rowcheck   # View distribution of missingness across rows
 
 
-
-
-#we need to check if the distribution of missing values is matches the distribution of the data for that column
+# ---- KS Test: Check Whether Missingness is Random ----
+# We compare distributions of other numeric variables when a variable is missing
+# versus when it is not missing. If distributions are similar, missingness is random,
+# which supports safe imputation.
 
 library(tidyverse)
 
+# Select numeric variables to run KS tests on
 numeric_vars <- Diabetes %>% select(where(is.numeric)) %>% names()
 
+# Function to test whether missingness affects the distribution of other variables
 check_dist_deviation <- function(df, var, all_vars, alpha = 0.05) {
   
-  miss_ind <- is.na(df[[var]])
+  miss_ind <- is.na(df[[var]])   # TRUE when variable is missing
   
-  # cannot test if no missing or fully missing
+  # Skip variable if no missing values or all missing values
   if (all(!miss_ind) || all(miss_ind)) {
     return(tibble(variable = var, deviates = FALSE, min_p = NA_real_))
   }
   
-  other_vars <- setdiff(all_vars, var)
+  other_vars <- setdiff(all_vars, var)   # compare var to all other numeric variables
   
+  # Run KS test comparing distributions when var IS missing vs. NOT missing
   pvals <- map_dbl(other_vars, function(o) {
-    x_obs  <- df[[o]][!miss_ind]     # distribution when var IS observed
-    x_miss <- df[[o]][miss_ind]      # distribution when var IS missing
+    x_obs  <- df[[o]][!miss_ind]     # distribution when var is observed
+    x_miss <- df[[o]][miss_ind]      # distribution when var is missing
     
-    # require at least 2 unique points in each distribution
+    # Need enough observations to run the KS test
     if (length(x_obs) < 5 || length(x_miss) < 5) return(NA_real_)
     
-    ks <- suppressWarnings(ks.test(x_obs, x_miss))
+    ks <- suppressWarnings(ks.test(x_obs, x_miss))   # KS test: compares distributions
     ks$p.value
   })
   
-  min_p <- min(pvals, na.rm = TRUE)
+  min_p <- min(pvals, na.rm = TRUE)    # lowest p-value across all comparisons
   
   tibble(
     variable = var,
-    deviates = min_p < alpha,
+    deviates = min_p < alpha,          # TRUE if missingness significantly changes distributions
     min_p = min_p
   )
 }
 
+# Apply KS test across all numeric variables
 distribution_results <- map_dfr(
   numeric_vars,
-  ~check_dist_deviation(Diabetes, .x, numeric_vars)
+  ~ check_dist_deviation(Diabetes, .x, numeric_vars)
 )
 
-
-#we see that the distributoon of NAS matches the distrubution of the data for each column
+# View whether missingness appears random for each variable
 distribution_results
 
+# Interpretation:
+# Most variables show no major distribution shift when missing,
+# meaning missingness behaves mostly randomly and imputation is safe.
 
-library(reticulate)
+library(reticulate) 
+
 
 ```
 
 
 
-```{python}
-
-py_install("pandas", pip=TRUE)
-
-pip install pandas
-
-import pandas as pd
-
-Var = pd.read_csv("/Users/rafa/Desktop/PhD/MAchine Learning/FinalProj/Diabetes.csv")
-
-```
-
-
-
-
-Imputing
-Ok so we can impute from mean, median, or mode but which makes sense to use?
-Well Are the distributions of all of our variables normally distributed because if they are not normally distributed then imputing could introduce error in parts of the distribution that happen to have higher density of NA’s that will be filled by our imputed values. Regardless, I think if the true values for these imputed points are in truth outliers or near the extremes of an approximately normal distribution, then we lose what could be very important data for modelling or interpretation as we send these observations towards the mean, median, mode etc. But what else can we do?
-
-Perhaps We can impute based on inferred covariance???? Like if we look at all our terms and see that column x covaries lets say about 1:1 with column z, then we should be able to impute based off the distribution of column z values we can project onto the curve of the column x value
-Like we predict the missing x value by projecting onto the covariance curve for that row’s corresponding z value
-
-
-So like if we see that bmi covaries strongly with self reported physical activity score 
-Then we use the reported activity of the person with missing values to predict the bmi 
-This is probably not very useful as a metric bc bmi is more complicated that this but for imputation i think basing it off covariance curves is a solid bet.
-
-We just need to test for covariance among all the relationships
+Imputing Missing Values
+To handle missing values, we first considered simple imputation methods such as mean, median, or mode replacement. However, these approaches can distort the data—especially when variables are not normally distributed or when outliers carry important information. We also considered regression-based imputation, where missing values are predicted using other strongly correlated variables. To evaluate whether this was appropriate, we examined the correlation structure among all numeric predictors. Because we did not observe strong correlations, regression-based imputation was not justified. For this reason, we chose to use a machine-learning-based method (Random Forest imputation), which captures complex, nonlinear relationships between variables and provides a more reliable way to estimate missing values.
 
 
 ```{r}
+# In this chunk, we check correlations between numeric variables.
+# If we found very strong correlations, regression-based imputation might make sense.
+# Since correlations are generally weak, we later decide to use Random Forest–based imputation instead.
+
 library(tidyverse)
 
 # Select numeric columns only
 num_df <- Diabetes %>% select(where(is.numeric))
 
-# Compute correlation matrix
+# Compute correlation matrix for numeric variables
 cor_mat <- cor(num_df, use = "pairwise.complete.obs")
 
-# Convert to a long dataframe
+# Convert correlation matrix to a long dataframe: var1 | var2 | correlation
 cor_df <- as.data.frame(as.table(cor_mat)) %>%
   rename(var1 = Var1, var2 = Var2, correlation = Freq)
 
-# Remove self correlations and duplicates (var1 = var2)
-#something doesnt feel right here
+# Remove self-correlations (var1 == var2) and duplicate pairs (keep only one of each pair)
 cor_df_clean <- cor_df %>%
   filter(var1 != var2) %>%
   group_by(pair = paste(pmin(var1, var2), pmax(var1, var2), sep = "_")) %>%
@@ -153,39 +142,46 @@ cor_df_clean <- cor_df %>%
   ungroup() %>%
   select(-pair)
 
+cor_df_clean   # We can inspect this to see if any pairs have very strong correlations
+
+# From this table, we saw that no variable pairs had strong enough correlation
+# to justify simple regression-based imputation. This motivates using ML-based imputation instead.
+
 ```
-#we see nothing has strong enough covariances to impute with reasonable justififcation
 
-
-
-
-
-
-
-
-
-Here is the real start Im going to begin by doing the training test split at 80:20
-
-but i need to make sure that when we split the data we are selecting random variables proportionally for each bar on the histogram right?
-so this is called stratified sampling
 
 ```{r}
+# In this chunk, we begin preparing the data for modeling by creating an 80/20
+# training–test split. We use stratified sampling to make sure the proportion
+# of diabetes vs. non-diabetes cases (the outcome variable) remains balanced
+# in both training and test sets. We then convert several binary predictors
+# into factor variables, which improves how classification models interpret them.
+
 library(tidyverse)
-library(randomForest)  # or ranger if you prefer (faster)
-library(caret)
+library(randomForest)  # later used for Random Forest imputation
+library(caret)         # provides createDataPartition() for stratified splitting
 
-set.seed(123)
+set.seed(123)          # ensures that the train–test split is reproducible
 
+# ---- Stratified Train–Test Split ----
+# createDataPartition() splits the data while keeping similar proportions
+# of the outcome (Diabetes_binary) in both the training and test sets.
 train_index <- createDataPartition(Diabetes$Diabetes_binary, p = 0.8, list = FALSE)
 
+# Create training (80%) and test (20%) subsets
 train <- Diabetes[train_index, ]
 test  <- Diabetes[-train_index, ]
 
-Diabeat<- Diabetes %>% filter(!is.na(Diabetes_binary))
-# Drop rows with missing outcomes 
+# Inspect rows that have non-missing outcome values
+# (Note: This object is not used in the split above but helps us explore missing outcomes.)
+Diabeat <- Diabetes %>% filter(!is.na(Diabetes_binary))
 
-str(Diabeat)
+str(Diabeat)  # Quick check of structure after filtering out missing outcomes
 
+
+# ---- Convert Binary Predictors to Factors ----
+# Many variables in this dataset are coded as 0/1 but conceptually represent categories.
+# Converting them to factors improves how models treat these variables.
 binary_vars <- c(
   "HighBP","HighChol","CholCheck","Smoker","Stroke","HeartDiseaseorAttack",
   "PhysActivity","Fruits","Veggies","HvyAlcoholConsump","AnyHealthcare",
@@ -193,77 +189,194 @@ binary_vars <- c(
 )
 
 train <- train %>%
-  mutate(across(all_of(binary_vars), ~factor(.x)))
+  mutate(across(all_of(binary_vars), ~ factor(.x)))
+
+# After this chunk, we have:
+# - a stratified train/test split
+# - binary predictors correctly converted to factors (in the training set)
+# These steps prepare the data for imputation and later machine-learning models.
 
 ```
 
 
-making the impute function with abilityto impute differently based on each data type
+
+
 ```{r}
+# In this chunk, we define a helper function that performs Random Forest–based imputation
+# for a single variable. For any variable with missing values, this function:
+# 1) Uses all other variables as predictors,
+# 2) Trains a Random Forest model on the rows where that variable is observed,
+# 3) Predicts and fills in the missing values.
+
 library(randomForest)
 
 impute_with_rf <- function(train_df, var_name) {
   
-  # rows with missing and non-missing values
+  # Find the row indices where this variable is missing
   miss_idx <- which(is.na(train_df[[var_name]]))
   
+  # If there are no missing values for this variable, just return the data unchanged
   if (length(miss_idx) == 0) {
     message("No missing values for ", var_name)
     return(train_df)
   }
   
+  # Find the row indices where this variable is observed (not missing)
   obs_idx <- which(!is.na(train_df[[var_name]]))
   
+  # Use all other variables in the dataset as predictors
   predictors <- setdiff(names(train_df), var_name)
   form <- as.formula(paste(var_name, "~", paste(predictors, collapse = " + ")))
   
+  # Check whether the target variable is numeric or not (just for labeling the message)
   y <- train_df[[var_name]]
   is_numeric <- is.numeric(y)
   
   message("Imputing ", var_name, " via Random Forest ",
           ifelse(is_numeric, "(regression)", "(classification)"))
   
+  # Fit a Random Forest model using only the rows where this variable is not missing
   rf_fit <- randomForest(
-    formula  = form,
-    data     = train_df[obs_idx, ],
-    ntree    = 200,
-    na.action = na.omit
+    formula   = form,
+    data      = train_df[obs_idx, ],
+    ntree     = 200,
+    na.action = na.omit      # ignore rows that have NAs in the predictor variables
   )
   
+  # Predict the missing values using the trained Random Forest model
   pred <- predict(rf_fit, newdata = train_df[miss_idx, ])
   
+  # Fill in the missing entries of this variable with the predicted values
   train_df[[var_name]][miss_idx] <- pred
   
+  # Return the updated data frame with imputed values for this variable
   return(train_df)
 }
-
-
-
-
-
 
 ```
 
 
+
+
 ```{r}
+# In this chunk, we:
+# 1) Identify which predictor variables in the training set still have missing values,
+# 2) Apply our Random Forest imputation function to each of those variables,
+
 vars_with_na <- train %>%
-  select(-Diabetes_binary) %>%         # don't ever impute outcome
-  summarise(across(everything(), ~any(is.na(.)))) %>%
-  pivot_longer(everything(), names_to = "var", values_to = "has_na") %>%
-  filter(has_na) %>%
-  pull(var)
+  select(-Diabetes_binary) %>%         # Exclude the outcome: we never impute Diabetes_binary
+  summarise(across(everything(), ~ any(is.na(.)))) %>%  # Check which columns have at least one NA
+  pivot_longer(everything(), names_to = "var", values_to = "has_na") %>%  # Turn into long format
+  filter(has_na) %>%                  
+  pull(var)                            
 
-vars_with_na
+vars_with_na   # List of variables that will be imputed
 
 
-
+# Create a copy of the training data that we will modify with imputed values
 train_imp <- train
 
+# Loop over each variable with missing values and impute it using our Random Forest function
 for (v in vars_with_na) {
   train_imp <- impute_with_rf(train_imp, v)
 }
 
+# Save the imputed training set to a CSV file so we can use it later for modeling
 write.csv(train_imp, "data/train_imputed.csv", row.names = FALSE)
 
+```
+
+
+
+## GAM Modeling
+```{r}
+library(mgcv)
+
+# Load the imputed training data
+train_imp <- read.csv("train_imputed.csv")
+
+# Make sure outcome is a factor
+train_imp$Diabetes_binary <- as.factor(train_imp$Diabetes_binary)
+
+# Quick check
+summary(train_imp$Diabetes_binary)
+
+# Check columns
+names(train_imp)
+
+```
+```{r}
+# First simple GAM model:
+
+gam_simple <- gam(
+  Diabetes_binary ~ s(Age) + s(BMI),
+  data   = train_imp,
+  family = binomial
+)
+
+# Look at the model summary
+summary(gam_simple)
+
+```
+
+```{r}
+# Plot the smooth effects of Age and BMI
+plot(gam_simple, shade = TRUE, seWithMean = TRUE)
+```
+
+
+```{r}
+# Turn these into factors (they're categorical scales, not true continuous)
+train_imp$GenHlth   <- as.factor(train_imp$GenHlth)
+train_imp$Education <- as.factor(train_imp$Education)
+train_imp$Income    <- as.factor(train_imp$Income)
+
+# Also make sure the other categorical ones are factors
+cat_vars <- c(
+  "HighBP","HighChol","CholCheck","Smoker","Stroke",
+  "HeartDiseaseorAttack","PhysActivity","Fruits","Veggies",
+  "HvyAlcoholConsump","AnyHealthcare","NoDocbcCost",
+  "DiffWalk","Sex"
+)
+
+train_imp[cat_vars] <- lapply(train_imp[cat_vars], as.factor)
+
+str(train_imp$GenHlth)
+str(train_imp$Education)
+str(train_imp$Income)
+
+```
+
+
+
+```{r}
+# Full GAM: 
+# smooth for truly continuous variables,
+# factors for the rest.
+
+gam_full <- gam(
+  Diabetes_binary ~ 
+    s(Age) + 
+    s(BMI) + 
+    s(MentHlth) + 
+    s(PhysHlth) +
+    GenHlth + Education + Income +   # now as factors
+    HighBP + HighChol + CholCheck + Smoker + Stroke +
+    HeartDiseaseorAttack + PhysActivity + Fruits + Veggies +
+    HvyAlcoholConsump + AnyHealthcare + NoDocbcCost +
+    DiffWalk + Sex,
+  data   = train_imp,
+  family = binomial,
+  method = "REML"
+)
+
+summary(gam_full)
+```
+
+
+
+```{r}
+## Step 3 – Plot smooth terms again
+plot(gam_full, pages = 1, shade = TRUE, seWithMean = TRUE)
 ```
 
