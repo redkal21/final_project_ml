@@ -1,0 +1,838 @@
+---
+title: "Whole_GAM_Pipeline"
+output: html_document
+date: "2025-12-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Generate The GAM uisng whichever dataset you provide, if you want separate df, change the variable names
+#df1 is without no modification, treating SVI as a linear variable and all other variables as linear
+#df2 is with splines for continuous variables and interaction terms
+#df3 is with splines for continuous variables and interaction terms and weighted data (he model pays more attention to diabetics since there are fewer of them)
+
+setwd("/scratch/nh2696/Machine_Learning/")
+Diabetes_file_w_outcomes <- c("Diabetes_imputed_train_dataset_1_aligned.csv")
+
+Diabetes_outcomes_df<-Diabetes_file_w_outcomes %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows() 
+
+#outcome_var<-c("Diabetes_binary") #binary so 0 and 1
+
+#outcome_df <- Diabetes_outcomes_df[, outcome_var]
+```
+
+
+```{r}
+Diabetes_imputed_w_outcomes_df=cbind(Diabetes_df,outcome_df)
+names(Diabetes_imputed_w_outcomes_df)[names(Diabetes_imputed_w_outcomes_df) == "outcome_df"] <- "Diabetes_binary"
+```
+
+```{r}
+# Assume Diabetes_imputed_w_outcomes_df has all covariates + outcome
+df_1 <- Diabetes_df
+```
+
+```{r}
+#SVI and all variables as linear
+outcome <- "Diabetes_binary"  # assume 0/1 or Yes/No
+svi_var <- "SVI_scaled"
+
+# Other covariates
+covariates <- c("HighBP", "HighChol", "CholCheck", "BMI", "Smoker",
+                "Stroke", "HeartDiseaseorAttack", "PhysActivity",
+                "Fruits", "Veggies", "HvyAlcoholConsump", "GenHlth",
+                "MentHlth", "PhysHlth", "DiffWalk",
+                "Sex", "Age")
+
+# Build formula: SVI as linear, others as linear (or splines if desired)
+formula_str <- paste(outcome, "~", svi_var, "+", paste(covariates, collapse = " + "))
+
+# Fit GAM with binomial family
+gam_model <- gam(as.formula(formula_str),
+                 family = binomial(),
+                 data = df_1)
+
+# Summary of the model
+summary(gam_model)
+
+# Optional: predicted probabilities
+df_1$predicted_prob <- predict(gam_model, type = "response")
+```
+
+
+
+```{r}
+# Ensure binary outcome is 0/1
+df_1[[outcome]] <- as.numeric(df_1[[outcome]] == 1)
+```
+
+```{r}
+get_classification_metrics <- function(actual, predicted_prob, threshold = 0.5) {
+  # Convert probabilities to class labels based on threshold
+  predicted_class <- ifelse(predicted_prob >= threshold, 1, 0)
+  
+  # Confusion matrix
+  conf_mat <- table(Predicted = predicted_class, Actual = actual)
+  
+  # Ensure all cells exist
+  TP <- ifelse(!is.na(conf_mat["1","1"]), conf_mat["1","1"], 0)
+  TN <- ifelse(!is.na(conf_mat["0","0"]), conf_mat["0","0"], 0)
+  FP <- ifelse(!is.na(conf_mat["1","0"]), conf_mat["1","0"], 0)
+  FN <- ifelse(!is.na(conf_mat["0","1"]), conf_mat["0","1"], 0)
+  
+  # Metrics
+  sensitivity <- TP / (TP + FN)        # True Positive Rate
+  specificity <- TN / (TN + FP)        # True Negative Rate
+  FPR <- FP / (FP + TN)                # False Positive Rate
+  FNR <- FN / (FN + TP)                # False Negative Rate
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  
+  # Return as a list
+  metrics <- list(
+    confusion_matrix = conf_mat,
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    FPR = FPR,
+    FNR = FNR,
+    accuracy = accuracy
+  )
+  
+  return(metrics)
+}
+
+
+actual <- df_1$Diabetes_binary
+predicted <- df_1$predicted_prob
+
+# Get metrics using 0.5 threshold
+metrics_0.5 <- get_classification_metrics(actual, predicted, threshold = 0.5)
+print(metrics_0.5)
+
+# Get metrics using 0.3 threshold (for underrepresented diabetics)
+metrics_0.3 <- get_classification_metrics(actual, predicted, threshold = 0.3)
+print(metrics_0.3)
+```
+
+
+```{r}
+
+# Robust bam() pipeline using SVI as linear + per-variable safe splines + pairwise continuous interactions
+library(mgcv)
+library(dplyr)
+
+# ---- User inputs ----
+df_2 <- Diabetes_df   # your dataframe (must contain Diabetes_binary & SVI_scaled etc)
+outcome     <- "Diabetes_binary"       # 0/1 outcome name
+svi_var     <- "SVI_scaled"            # SVI included as linear term
+
+# Continuous covariates (exclude Education/Income since you replace them with SVI)
+cont_var <- c("BMI", "Age", "PhysHlth", "MentHlth", "GenHlth")
+
+# Categorical covariates (keep as factors / parametric)
+cat_var <- c("HighBP", "HighChol", "CholCheck", "Smoker",
+             "Stroke", "HeartDiseaseorAttack", "PhysActivity",
+             "Fruits", "Veggies", "HvyAlcoholConsump",
+             "DiffWalk", "Sex")
+
+max_k_requested <- 5   # desired upper bound for spline basis dimension
+nthreads <- 14         # HPC cores to use for bam()
+
+# ---- Basic checks and conversions ----
+# Ensure data frame present
+if (!exists("df_2")) stop("Data frame 'df_2' not found. Set df <- Diabetes_imputed_w_outcomes_df")
+
+# Ensure outcome is 0/1 numeric
+if (!is.numeric(df_2[[outcome]])) {
+  df_2[[outcome]] <- as.numeric(as.character(df_2[[outcome]]))
+}
+# If values are not 0/1, convert logical/YesNo -> 0/1
+unique_out <- sort(unique(na.omit(df_2[[outcome]])))
+if (!all(unique_out %in% c(0,1))) {
+  # try coerce logical or "Yes"/"No"
+  if (all(unique_out %in% c(0,1,NA))) {
+    # ok
+  } else {
+    # attempt common conversions
+    df_2[[outcome]] <- ifelse(tolower(as.character(df_2[[outcome]])) %in% c("yes","y","1","true","t"), 1,
+                            ifelse(tolower(as.character(df_2[[outcome]])) %in% c("no","n","0","false","f"), 0, NA))
+  }
+}
+
+# Force categorical variables to factor
+for (v in cat_var) {
+  if (!v %in% names(df_2)) stop(paste0("Categorical variable '", v, "' not found in df_2"))
+  df_2[[v]] <- as.factor(df_2[[v]])
+}
+
+# Check continuous vars existence and decide whether to treat as continuous or factor
+cont_var_safe <- c()
+binary_from_cont <- c()
+var_k <- list()
+
+for (v in cont_var) {
+  if (!v %in% names(df_2)) stop(paste0("Continuous variable '", v, "' not found in df_2"))
+  x <- df_2[[v]]
+  nuniq <- length(unique(na.omit(x)))
+  # If variable has <= 2 unique values => treat as factor (move to cat_var)
+  if (nuniq <= 2) {
+    cat_var <- union(cat_var, v)
+    binary_from_cont <- c(binary_from_cont, v)
+  } else {
+    # Choose k safely: at most nuniq - 1 and at most max_k_requested
+    k_safe <- min(max_k_requested, max(3, nuniq - 1))  # ensure k >= 3 for a meaningful spline (adjustable)
+    cont_var_safe <- c(cont_var_safe, v)
+    var_k[[v]] <- k_safe
+  }
+}
+
+# Inform the user
+cat("Continuous vars to use with splines (and chosen k):\n")
+print(var_k)
+if (length(binary_from_cont) > 0) {
+  cat("The following 'continuous' vars had <= 2 unique values and will be treated as factors:", paste(binary_from_cont, collapse=", "), "\n")
+}
+
+# Rebuild cat_var to include those detected as binary
+cat_var <- unique(cat_var)
+
+# ---- Build formula components ----
+terms_list <- character(0)
+
+# SVI as linear
+if (!svi_var %in% names(df_2)) stop("SVI variable not found in df_2")
+terms_list <- c(terms_list, svi_var)
+
+# Add spline main effects for continuous safe vars
+for (v in cont_var_safe) {
+  k_v <- var_k[[v]]
+  terms_list <- c(terms_list, paste0("s(", v, ", k=", k_v, ")"))
+}
+
+# Add categorical main effects (parametric factors)
+terms_list <- c(terms_list, cat_var)
+
+# Build pairwise continuous x continuous tensor interactions
+interaction_terms_cc <- character(0)
+if (length(cont_var_safe) > 1) {
+  for (i in seq_len(length(cont_var_safe)-1)) {
+    for (j in seq((i+1), length(cont_var_safe))) {
+      v1 <- cont_var_safe[i]; v2 <- cont_var_safe[j]
+      k1 <- var_k[[v1]]; k2 <- var_k[[v2]]
+      # Use ti() with explicit k vector c(k1,k2)
+      # specify k as "k=c(k1,k2)" inside call
+      interaction_terms_cc <- c(interaction_terms_cc,
+                                paste0("ti(", v1, ",", v2, ", k = c(", k1, ",", k2, "))"))
+    }
+  }
+}
+
+# Optionally add continuous x categorical interactions using s(..., by=factor)
+interaction_terms_cg <- character(0)
+for (v in cont_var_safe) {
+  for (f in cat_var) {
+    # only sensible if factor has >1 level
+    if (nlevels(df_2[[f]]) > 1) {
+      k_v <- var_k[[v]]
+      interaction_terms_cg <- c(interaction_terms_cg, paste0("s(", v, ", by=", f, ", k=", k_v, ")"))
+    }
+  }
+}
+
+# (Skip categorical x categorical interactions as parametric ":" unless specifically wanted)
+# Combine all terms
+all_terms <- c(terms_list, interaction_terms_cc, interaction_terms_cg)
+
+# Construct formula
+formula_str <- paste0(outcome, " ~ ", paste(all_terms, collapse = " + "))
+cat("Final formula (preview):\n")
+cat(formula_str, "\n\n")
+
+# ---- Fit bam() ----
+# Use discrete=TRUE for large data; set nthreads from user input
+# We wrap fit in tryCatch to present any mgcv errors clearly
+fit_result <- tryCatch({
+  bam_fit <- bam(as.formula(formula_str),
+                 data = df_2,
+                 family = binomial(),
+                 discrete = TRUE,
+                 nthreads = nthreads,
+                 select = TRUE,
+                 method = "fREML")   # fREML often fast & robust
+  bam_fit
+}, error = function(e) {
+  message("bam() failed with error:\n", e$message)
+  stop(e)
+})
+
+# ---- Post-fit reporting ----
+print(summary(fit_result))
+
+# Predict probabilities (on df_2)
+df_2$predicted_prob_bam <- predict(fit_result, newdata = df_2, type = "response")
+
+# Basic evaluation on training data
+if (!all(is.na(df_2[[outcome]]))) {
+  library(pROC)
+  roc_obj <- roc(df_2[[outcome]], df_2$predicted_prob_bam, direction = "<")
+  cat("AUC on training data:", round(auc(roc_obj), 3), "\n")
+}
+
+# Save fit object to workspace
+bam_model <- fit_result
+
+# End
+
+```
+
+```{r}
+summary(bam_model)
+```
+
+```{r}
+# ----------------------------
+# Predicted probabilities
+# ----------------------------
+df_2$predicted_prob <- predict(bam_model, type="response")
+
+# ----------------------------
+# Evaluate model performance
+# ----------------------------
+# ROC and AUC
+roc_obj <- roc(df_2[[outcome]],
+               df_2$predicted_prob)
+auc_val <- auc(roc_obj)
+cat("AUC:", round(auc_val, 3), "\n")
+
+# Optional: calibration plot
+calib_df <- df_2 %>%
+  mutate(bin = cut(predicted_prob, breaks = seq(0, 1, 0.1))) %>%
+  group_by(bin) %>%
+  summarise(mean_pred = mean(predicted_prob),
+            mean_actual = mean(!!sym(outcome)), .groups="drop")
+
+ggplot(calib_df, aes(x=mean_pred, y=mean_actual)) +
+  geom_point() +
+  geom_line(color='blue') +
+  geom_abline(slope=1, intercept=0, linetype='dashed', color='red') +
+  labs(x="Mean predicted probability", y="Observed proportion",
+       title="Calibration plot") +
+  theme_minimal()
+
+# ----------------------------
+# Optional: extract terms with effective degrees of freedom > small value
+# This can be used to pick "important" interactions automatically
+# ----------------------------
+edf <- summary(bam_model)$s.table[, "edf"]
+term_names <- rownames(summary(bam_model)$s.table)
+important_terms <- term_names[edf > 0.1]
+cat("Important terms (edf > 0.1):\n")
+print(important_terms)
+
+```
+
+
+
+
+```{r}
+get_classification_metrics <- function(actual, predicted_prob, threshold = 0.5) {
+  # Convert probabilities to class labels based on threshold
+  predicted_class <- ifelse(predicted_prob >= threshold, 1, 0)
+  
+  # Confusion matrix
+  conf_mat <- table(Predicted = predicted_class, Actual = actual)
+  
+  # Ensure all cells exist
+  TP <- ifelse(!is.na(conf_mat["1","1"]), conf_mat["1","1"], 0)
+  TN <- ifelse(!is.na(conf_mat["0","0"]), conf_mat["0","0"], 0)
+  FP <- ifelse(!is.na(conf_mat["1","0"]), conf_mat["1","0"], 0)
+  FN <- ifelse(!is.na(conf_mat["0","1"]), conf_mat["0","1"], 0)
+  
+  # Metrics
+  sensitivity <- TP / (TP + FN)        # True Positive Rate
+  specificity <- TN / (TN + FP)        # True Negative Rate
+  FPR <- FP / (FP + TN)                # False Positive Rate
+  FNR <- FN / (FN + TP)                # False Negative Rate
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  
+  # Return as a list
+  metrics <- list(
+    confusion_matrix = conf_mat,
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    FPR = FPR,
+    FNR = FNR,
+    accuracy = accuracy
+  )
+  
+  return(metrics)
+}
+
+
+actual <- df_2$Diabetes_binary
+predicted <- df_2$predicted_prob
+
+# Get metrics using 0.5 threshold
+metrics_0.5 <- get_classification_metrics(actual, predicted, threshold = 0.5)
+print(metrics_0.5)
+
+# Get metrics using 0.3 threshold (for underrepresented diabetics)
+metrics_0.3 <- get_classification_metrics(actual, predicted, threshold = 0.3)
+print(metrics_0.3)
+```
+
+```{r}
+#Weights to focus on diabetics
+###############################################################
+#            FULL GAM (bam) PIPELINE WITH INTERACTIONS
+#      + predictions + TP/FP/TN/FN + calibration + term selection
+###############################################################
+
+library(mgcv)
+library(dplyr)
+library(pROC)
+library(ggplot2)
+
+# ------------------------------------------------------------
+# USER INPUTS
+# ------------------------------------------------------------
+df_3 <- Diabetes_df
+outcome <- "Diabetes_binary"
+svi_var <- "SVI_scaled"
+
+cont_var <- c("BMI", "Age", "PhysHlth", "MentHlth", "GenHlth")
+cat_var <- c("HighBP", "HighChol", "CholCheck", "Smoker",
+             "Stroke", "HeartDiseaseorAttack", "PhysActivity",
+             "Fruits", "Veggies", "HvyAlcoholConsump",
+             "DiffWalk", "Sex")
+
+max_k_requested <- 5
+nthreads <- 14
+
+# ------------------------------------------------------------
+# OUTCOME CHECKS
+# ------------------------------------------------------------
+df_3[[outcome]] <- as.numeric(df_3[[outcome]])
+if (!all(df_3[[outcome]] %in% c(0,1))) {
+  df_3[[outcome]] <- ifelse(df_3[[outcome]] %in% c("Yes","Y","1","True","T"),1,0)
+}
+
+# ------------------------------------------------------------
+# FACTOR HANDLING
+# ------------------------------------------------------------
+for (v in cat_var) df_3[[v]] <- as.factor(df_3[[v]])
+
+# Determine which continuous vars have enough unique values
+cont_var_safe <- c()
+var_k <- list()
+
+for (v in cont_var) {
+  nuniq <- length(unique(na.omit(df_3[[v]])))
+  if (nuniq > 2) {
+    k_safe <- min(max_k_requested, max(3, nuniq - 1))
+    cont_var_safe <- c(cont_var_safe, v)
+    var_k[[v]] <- k_safe
+  } else {
+    cat_var <- union(cat_var, v)
+  }
+}
+
+cat("Spline variables & k:\n")
+print(var_k)
+
+# ------------------------------------------------------------
+# FORMULA CONSTRUCTION
+# ------------------------------------------------------------
+terms_list <- c(svi_var)
+
+# spline main effects
+for (v in cont_var_safe) {
+  terms_list <- c(terms_list, paste0("s(", v, ", k=", var_k[[v]], ", bs='cs')"))
+}
+
+# factor main effects
+terms_list <- c(terms_list, cat_var)
+
+# continuous × continuous tensor interactions
+interaction_terms_cc <- c()
+if (length(cont_var_safe) > 1) {
+  for (i in seq_len(length(cont_var_safe)-1)) {
+    for (j in (i+1):length(cont_var_safe)) {
+      v1 <- cont_var_safe[i]; v2 <- cont_var_safe[j]
+      interaction_terms_cc <- c(
+        interaction_terms_cc,
+        paste0("ti(", v1, ",", v2, ", k=c(", var_k[[v1]], ",", var_k[[v2]], "), bs=c('cs','cs'))")
+      )
+    }
+  }
+}
+
+# continuous × categorical interactions
+interaction_terms_cg <- c()
+for (v in cont_var_safe) {
+  for (f in cat_var) {
+    if (nlevels(df_3[[f]]) > 1) {
+      interaction_terms_cg <- c(interaction_terms_cg,
+                                paste0("s(", v, ", by=", f, ", k=", var_k[[v]], ", bs='cs')"))
+    }
+  }
+}
+
+all_terms <- c(terms_list, interaction_terms_cc, interaction_terms_cg)
+
+formula_str <- paste0(outcome, " ~ ", paste(all_terms, collapse=" + "))
+cat("\nFinal GAM Formula:\n")
+cat(formula_str, "\n\n")
+
+# ------------------------------------------------------------
+# MODEL FITTING (bam)
+# shrinkage enabled via select=TRUE
+# ------------------------------------------------------------
+bam_model_weights <- bam(as.formula(formula_str),
+                 data=df_3,
+                 family=binomial(),
+                 discrete=TRUE,
+                 nthreads=nthreads,
+                 select=TRUE,
+                 method="fREML")
+
+cat("\nModel Fit Complete.\n")
+print(summary(bam_model_weights))
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# PREDICTED PROBABILITIES
+# ------------------------------------------------------------
+df_3$predicted_prob <- predict(bam_model_weights, newdata=df_3, type="response")
+
+# ------------------------------------------------------------
+# OPTION: THRESHOLD-BASED PERFORMANCE METRICS
+# ------------------------------------------------------------
+compute_confusion <- function(y, p, thresh=0.5) {
+  pred_class <- ifelse(p >= thresh, 1, 0)
+  TP <- sum(pred_class==1 & y==1)
+  FP <- sum(pred_class==1 & y==0)
+  TN <- sum(pred_class==0 & y==0)
+  FN <- sum(pred_class==0 & y==1)
+
+  list(
+    TP=TP, FP=FP, TN=TN, FN=FN,
+    Sensitivity = TP/(TP+FN),
+    Specificity = TN/(TN+FP),
+    FPR = FP/(FP+TN),
+    Precision = TP/(TP+FP),
+    Accuracy = (TP+TN) / (TP+TN+FP+FN)
+  )
+}
+
+perf <- compute_confusion(df_3[[outcome]], df_3$predicted_prob, thresh=0.3)
+cat("\nConfusion Matrix metrics at threshold = 0.30:\n")
+print(perf)
+
+# ------------------------------------------------------------
+# ROC / AUC
+# ------------------------------------------------------------
+roc_obj <- roc(df_3[[outcome]], df_3$predicted_prob)
+cat("\nAUC:", round(auc(roc_obj), 3), "\n")
+
+# ------------------------------------------------------------
+# CALIBRATION PLOT
+# ------------------------------------------------------------
+calib_df <- df_3 %>%
+  mutate(bin = cut(predicted_prob, breaks=seq(0,1,0.1))) %>%
+  group_by(bin) %>%
+  summarise(mean_pred=mean(predicted_prob),
+            mean_actual=mean(.data[[outcome]]),
+            .groups="drop")
+
+ggplot(calib_df, aes(x=mean_pred, y=mean_actual)) +
+  geom_point() +
+  geom_line() +
+  geom_abline(slope=1, intercept=0, linetype="dashed", color="red") +
+  labs(title="Calibration Plot", x="Mean Predicted", y="Observed Diabetes Rate") +
+  theme_minimal()
+
+# ------------------------------------------------------------
+# IMPORTANT TERMS USING EDF SHRINKAGE
+# ------------------------------------------------------------
+s_table <- summary(bam_model_weights)$s.table
+edf_values <- s_table[, "edf"]
+term_names <- rownames(s_table)
+
+important_terms <- term_names[edf_values > 0.1]
+
+cat("\nImportant GAM Terms (edf > 0.1):\n")
+print(important_terms)
+
+###############################################################
+# END OF PIPELINE
+###############################################################
+
+```
+
+```{r}
+###############################################################
+#   CONFUSION MATRIX + METRICS (using existing bam_model_weights)
+###############################################################
+
+# Make sure outcome and probabilities exist
+stopifnot("Diabetes_binary" %in% names(df_3))
+stopifnot("predicted_prob" %in% names(df_3))
+
+# Function to compute confusion matrix & performance
+compute_confusion <- function(y, p, thresh=0.5) {
+  pred_class <- ifelse(p >= thresh, 1, 0)
+
+  TP <- sum(pred_class == 1 & y == 1)
+  FP <- sum(pred_class == 1 & y == 0)
+  TN <- sum(pred_class == 0 & y == 0)
+  FN <- sum(pred_class == 0 & y == 1)
+
+  # Safe calculations (avoid NaN)
+  precision <- ifelse((TP + FP) == 0, NA, TP/(TP+FP))
+  recall    <- ifelse((TP + FN) == 0, NA, TP/(TP+FN))
+  specificity <- ifelse((TN + FP) == 0, NA, TN/(TN+FP))
+  f1 <- ifelse(is.na(precision) | is.na(recall) | (precision+recall)==0,
+               NA, 2 * precision * recall / (precision + recall))
+
+  list(
+    Threshold = thresh,
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    Accuracy = (TP+TN) / (TP+TN+FP+FN),
+    Precision = precision,
+    Recall_TPR = recall,
+    Specificity_TNR = specificity,
+    F1 = f1,
+    FPR = FP/(FP+TN),
+    FNR = FN/(TP+FN)
+  )
+}
+
+# ---- CHANGE THRESHOLD HERE ----
+threshold_to_use <- 0.5
+
+perf <- compute_confusion(df_3$Diabetes_binary,
+                          df_3$predicted_prob,
+                          thresh = threshold_to_use)
+
+cat("\n================ CONFUSION MATRIX METRICS ================\n")
+print(perf)
+
+# ----- Confusion matrix table -----
+pred_class <- ifelse(df_3$predicted_prob >= threshold_to_use, 1, 0)
+
+conf_mat <- table(
+  Actual = df_3$Diabetes_binary,
+  Predicted = pred_class
+)
+
+cat("\n================ CONFUSION MATRIX (TABLE) ================\n")
+print(conf_mat)
+###############################################################
+
+```
+
+```{r}
+###############################################################
+# PIPELINE: Compare GAM predictions at multiple thresholds
+# Uses existing bam_model_weights and df$predicted_prob
+###############################################################
+
+library(dplyr)
+
+# Make sure the df_3 columns exist
+stopifnot("Diabetes_binary" %in% names(df_3))
+stopifnot("predicted_prob" %in% names(df_3))
+
+# Function to compute confusion matrix & metrics
+compute_confusion <- function(actual, predicted_prob, thresh = 0.5) {
+  pred_class <- ifelse(predicted_prob >= thresh, 1, 0)
+
+  TP <- sum(pred_class == 1 & actual == 1)
+  FP <- sum(pred_class == 1 & actual == 0)
+  TN <- sum(pred_class == 0 & actual == 0)
+  FN <- sum(pred_class == 0 & actual == 1)
+
+  precision <- ifelse((TP + FP) == 0, NA, TP/(TP + FP))
+  recall    <- ifelse((TP + FN) == 0, NA, TP/(TP + FN))
+  specificity <- ifelse((TN + FP) == 0, NA, TN/(TN + FP))
+  f1 <- ifelse(is.na(precision) | is.na(recall) | (precision + recall) == 0,
+               NA, 2 * precision * recall / (precision + recall))
+
+  list(
+    Threshold = thresh,
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    Accuracy = (TP + TN) / (TP + TN + FP + FN),
+    Precision = precision,
+    Recall_TPR = recall,
+    Specificity_TNR = specificity,
+    F1 = f1,
+    FPR = FP / (FP + TN),
+    FNR = FN / (TP + FN),
+    Confusion_Matrix = matrix(c(TN, FP, FN, TP), nrow = 2,
+                              dimnames = list("Predicted" = c(0,1),
+                                              "Actual" = c(0,1))))
+}
+
+# Specify thresholds to compare
+thresholds <- c(0.1, 0.2, 0.3, 0.4, 0.5)
+
+# Iterate and store results
+results_list <- lapply(thresholds, function(t) {
+  compute_confusion(df_3$Diabetes_binary, df_3$predicted_prob, thresh = t)
+})
+
+# Convert results to a tidy table for easy viewing
+results_summary <- do.call(rbind, lapply(results_list, function(x) {
+  data.frame(
+    Threshold = x$Threshold,
+    TP = x$TP, FP = x$FP, TN = x$TN, FN = x$FN,
+    Accuracy = x$Accuracy,
+    Precision = x$Precision,
+    Recall_TPR = x$Recall_TPR,
+    Specificity_TNR = x$Specificity_TNR,
+    F1 = x$F1,
+    FPR = x$FPR,
+    FNR = x$FNR
+  )
+}))
+
+print(results_summary)
+
+# Optional: print confusion matrices for each threshold
+for (i in seq_along(results_list)) {
+  cat("\n================ Confusion Matrix at threshold =", thresholds[i], "================\n")
+  print(results_list[[i]]$Confusion_Matrix)
+}
+
+```
+
+```{r}
+library(pROC)
+library(ggplot2)
+library(dplyr)
+
+# Create temporary data frame for plotting
+roc_plot_df <- data.frame(
+  actual = df_3$Diabetes_binary,
+  pred_linear = df_1$predicted_prob,    # Linear SVI GAM
+  pred_gam    = df_2$predicted_prob,    # GAM with splines
+  pred_bam    = df_3$predicted_prob     # BAM full model with interactions
+)
+
+# Create ROC objects
+roc_linear <- roc(roc_plot_df$actual, roc_plot_df$pred_linear)
+roc_gam    <- roc(roc_plot_df$actual, roc_plot_df$pred_gam)
+roc_bam    <- roc(roc_plot_df$actual, roc_plot_df$pred_bam)
+
+# Combine ROC data for ggplot
+roc_df <- bind_rows(
+  data.frame(
+    FPR = 1 - roc_linear$specificities,
+    TPR = roc_linear$sensitivities,
+    Model = "Linear"
+  ),
+  data.frame(
+    FPR = 1 - roc_gam$specificities,
+    TPR = roc_gam$sensitivities,
+    Model = "Interactions"
+  ),
+  data.frame(
+    FPR = 1 - roc_bam$specificities,
+    TPR = roc_bam$sensitivities,
+    Model = "Weights"
+  )
+)
+
+# Plot ROC curves
+ggplot(roc_df, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(size = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  labs(title = "ROC Curves for GAM Implementations",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2") +
+  annotate("text", x = 0.2, y = 0.4,
+           label = paste0("All Linear Terms: ", round(auc(roc_linear), 2), 
+                          "\nInteractions and shrinkage: ", round(auc(roc_gam), 2),
+                          "\nInteractions, shrinkage, and weighting: ", round(auc(roc_bam), 2)),
+           hjust = 0)
+
+# Optionally save
+# ggsave("ROC_GAM_models.png", width = 9, height = 5, dpi = 300)
+
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(mgcv)
+
+df <- Diabetes_imputed_w_outcomes_df
+outcome <- "Diabetes_binary"
+svi_var <- "SVI_scaled"
+
+# ---- 1. Histogram + density ----
+p1 <- ggplot(df, aes(x = .data[[svi_var]])) +
+  geom_histogram(aes(y = ..density..), binwidth = 0.1, fill="skyblue", color="black", alpha=0.5) +
+  geom_density(color="darkblue", size=1) +
+  theme_minimal() +
+  labs(title="Distribution of SVI", x="SVI_scaled", y="Density")
+print(p1)
+
+# ---- 2. Boxplot by outcome ----
+p2 <- ggplot(df, aes(x = factor(.data[[outcome]]), y = .data[[svi_var]])) +
+  geom_boxplot(fill="orange") +
+  theme_minimal() +
+  labs(title="SVI by Diabetes Outcome", x="Diabetes (0/1)", y="SVI_scaled")
+print(p2)
+
+# ---- 3. Density by outcome ----
+p3 <- ggplot(df, aes(x = .data[[svi_var]], fill = factor(.data[[outcome]]))) +
+  geom_density(alpha=0.4) +
+  theme_minimal() +
+  labs(title="SVI Density by Diabetes Outcome", x="SVI_scaled", fill="Diabetes")
+print(p3)
+
+# ---- 4. Quartile-based diabetes proportion ----
+df <- df %>% mutate(SVI_quartile = ntile(.data[[svi_var]], 4))
+p4 <- ggplot(df, aes(x = factor(SVI_quartile), y = .data[[outcome]])) +
+  stat_summary(fun = mean, geom = "bar", fill="steelblue") +
+  theme_minimal() +
+  labs(title="Proportion of Diabetes by SVI Quartile",
+       x="SVI Quartile (Q1=lowest, Q4=highest)", y="Proportion with Diabetes")
+print(p4)
+
+# ---- 5. Smooth GAM-style effect plot (optional) ----
+# Only if you have a GAM fitted, e.g., gam_model
+if (exists("gam_model")) {
+  svi_grid <- seq(min(df[[svi_var]], na.rm=TRUE), max(df[[svi_var]], na.rm=TRUE), length.out=100)
+  newdata <- df[rep(1,100),]  # dummy df for prediction
+  newdata[[svi_var]] <- svi_grid
+  
+  pred <- predict(gam_model, newdata=newdata, type="response", se.fit=TRUE)
+  smooth_df <- data.frame(SVI_scaled = svi_grid,
+                          fit = pred$fit,
+                          lower = pred$fit - 1.96*pred$se.fit,
+                          upper = pred$fit + 1.96*pred$se.fit)
+  
+  p5 <- ggplot(smooth_df, aes(x = SVI_scaled, y = fit)) +
+    geom_ribbon(aes(ymin=lower, ymax=upper), alpha=0.2, fill="lightblue") +
+    geom_line(color="blue", size=1) +
+    theme_minimal() +
+    labs(title="GAM Partial Effect of SVI on Diabetes",
+         x="SVI_scaled", y="Predicted Probability")
+  print(p5)
+}
+
+```
+

@@ -1,0 +1,304 @@
+---
+title: "Spline_GAM_Diabetes"
+output: html_document
+date: "2025-12-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Imports the dataset, chnage for test and train datasets (also for your filepaths)
+
+setwd("/scratch/nh2696/Machine_Learning/")
+library(dplyr)
+library(readr)
+one_file <- c("Diabetes_imputed_test_dataset_1_aligned.csv")
+
+test_Diabetes_df<-one_file %>%
+  lapply(read.csv, stringsAsFactors = FALSE) %>%
+  bind_rows() 
+```
+```{r}
+# Flip NoDocBcCost: 1 becomes 0, 0 becomes 1 so all variables want all less vulnerable metrics to increase
+test_Diabetes_df$NoDocbcCost_flipped <- 1 - test_Diabetes_df$NoDocbcCost
+
+```
+
+```{r}
+library(mgcv)
+library(dplyr)
+library(PCAmixdata)
+library(ggplot2)
+library(tidyr)
+```
+
+
+```{r}
+#Setting continuous variables (which are using splines) to find nonlinearity, PCAMix to use continuous and categorical variables in the same PCA
+#Not looking at interactions between variables here
+
+cont_var<-c("Education","Income") #range from 1 to 6 and 1 to 8, respectively
+cat_var<-c("NoDocbcCost_flipped","AnyHealthcare") #binary so 0 and 1
+
+cont_df <- test_Diabetes_df[, cont_var]
+cat_df  <- test_Diabetes_df[, cat_var] %>% mutate(across(everything(), as.factor)) #for PCAmix, they must be made into factors
+
+spline_list <- vector("list", length = ncol(cont_df))
+
+for (i in seq_len(ncol(cont_df))) { #for each continuous variables
+  x<-cont_df[[i]]
+  spline_basis<-smoothCon(s(x, k = 5), data = data.frame(x = x), knots = NULL)[[1]]$X #use smoothCon to make 5 spline basis for the variable being looped through
+  spline_list[[i]]<-spline_basis 
+}
+
+X_spline <- do.call(cbind, spline_list) #spline lists as a matrix
+
+col_has_var_index=logical(ncol(X_spline))
+for (i in seq_len(ncol(X_spline))) {
+  if (sd(as.numeric(X_spline[, i])) > 0) {
+    col_has_var_index[i] <- TRUE
+  } 
+  else {
+    col_has_var_index[i] <- FALSE
+  }
+}
+
+X_spline <- X_spline[, col_has_var_index] #only include columns in the spline matrix that are not constant
+
+spline_df <- as.data.frame(X_spline)
+
+spline_colnames <- c()
+index <- 1
+
+#Need to name only columns that are not constant
+for (i in seq_along(spline_list)){
+  n_cols<-ncol(spline_list[[i]])
+  end<-index + n_cols - 1
+  cols_w_var<-which(col_has_var_index[index:end])
+  if (length(cols_w_var) > 0){
+    spline_colnames <- c(spline_colnames, paste0(cont_var[i], "_spline", cols_w_var))
+  }
+  index<-end + 1
+}
+colnames(spline_df)<-spline_colnames
+
+#PCAmix can use both categorical and continuous variables
+res<-PCAmix(X.quanti = spline_df, X.quali = cat_df, rename.level = TRUE, ndim = 5)
+
+#SVI is the first principal component
+test_Diabetes_df$SVI <- res$ind$coord[,1] #extracts PC1 for each observation
+
+test_Diabetes_df$SVI_scaled<-(test_Diabetes_df$SVI-min(test_Diabetes_df$SVI))/(max(test_Diabetes_df$SVI)-min(test_Diabetes_df$SVI)) #scales SVI between 0 and 1
+
+summary(test_Diabetes_df$SVI_scaled)
+hist(test_Diabetes_df$SVI_scaled, main="SVI from PC1 (no interactions)", xlab="SVI (scaled)")
+```
+```{r}
+#Same analysis but looking at a pairwaise interactions 
+#Pairwise comparison (education and income)
+#Continuous by continuous pairwise (spline bases)
+interaction_list<-list()
+for (i in 1:(length(cont_var)-1)) {
+  for (j in (i+1):length(cont_var)) {
+    mat1 <- spline_list[[i]][, col_has_var_index[sum(sapply(spline_list[1:i], ncol)) - ncol(spline_list[[i]]) + 1 : ncol(spline_list[[i]])], drop=FALSE]
+    mat2 <- spline_list[[j]][, col_has_var_index[sum(sapply(spline_list[1:j], ncol)) - ncol(spline_list[[j]]) + 1 : ncol(spline_list[[j]])], drop=FALSE]
+    for (c1 in 1:ncol(mat1)) {
+      for (c2 in 1:ncol(mat2)) {
+        interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2])]] <- mat1[, c1] * mat2[, c2]
+      }
+    }
+  }
+}
+
+X_interactions<-do.call(cbind, interaction_list)
+
+#Combine spline main effects and interaction terms
+X_quanti_full<-cbind(spline_df, as.data.frame(X_interactions))
+
+res <- PCAmix(X.quanti = X_quanti_full, X.quali = cat_df, rename.level = TRUE, ndim = 5)
+
+#PC1
+test_Diabetes_df$SVI <- res$ind$coord[,1]
+
+#Rescale
+test_Diabetes_df$SVI_scaled <- (test_Diabetes_df$SVI-min(test_Diabetes_df$SVI))/(max(test_Diabetes_df$SVI)-min(test_Diabetes_df$SVI))
+
+summary(test_Diabetes_df$SVI_scaled)
+hist(test_Diabetes_df$SVI_scaled, main="SVI from PC1 (with education-income interaction)", xlab="SVI (scaled)")
+
+```
+
+```{r}
+#Same analysis but this time looking at all possible interactions
+interaction_list <- list()
+
+#Continuous by continuous pairwise (spline bases), Pairwise 1
+if(length(cont_var) > 1){
+  for(i in 1:(length(cont_var)-1)){
+    for(j in (i+1):length(cont_var)){
+      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df))]
+      for(c1 in 1:ncol(mat1)){
+        for(c2 in 1:ncol(mat2)){
+          interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2])]] <- mat1[, c1] * mat2[, c2]
+        }
+      }
+    }
+  }
+}
+
+#Continuous by categorical pairwise, Pairwise 2
+for(i in seq_along(cont_var)){
+  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+  for(j in seq_along(cat_var)){
+    cat_numeric <- as.numeric(cat_df[[j]])
+    for(c in 1:ncol(mat)){
+      interaction_list[[paste0(colnames(mat)[c], "_x_", cat_var[j])]] <- mat[, c] * cat_numeric
+    }
+  }
+}
+
+#Categorical by categorical pairwise, Pairwise 3
+if(length(cat_var) > 1){
+  for(i in 1:(length(cat_var)-1)){
+    for(j in (i+1):length(cat_var)){
+      interaction_list[[paste0(cat_var[i], "_x_", cat_var[j])]] <- as.numeric(cat_df[[i]]) * as.numeric(cat_df[[j]])
+    }
+  }
+}
+
+#Continuous by continuous by categorical three-way comp 1
+if(length(cont_var) > 1 & length(cat_var) >= 1){
+  for(i in 1:(length(cont_var)-1)){
+    for(j in (i+1):length(cont_var)){
+      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df))]
+      for(k in seq_along(cat_var)){
+        cat_numeric <- as.numeric(cat_df[[k]])
+        for(c1 in 1:ncol(mat1)){
+          for(c2 in 1:ncol(mat2)){
+            interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2], "_x_", cat_var[k])]] <- mat1[, c1] * mat2[, c2] * cat_numeric
+          }
+        }
+      }
+    }
+  }
+}
+
+#Continuous by categorical by categorical three-way comp 2
+for(i in seq_along(cont_var)){
+  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+  for(j in 1:(length(cat_var)-1)){
+    for(k in (j+1):length(cat_var)){
+      cat_num1 <- as.numeric(cat_df[[j]])
+      cat_num2 <- as.numeric(cat_df[[k]])
+      for(c in 1:ncol(mat)){
+        interaction_list[[paste0(colnames(mat)[c], "_x_", cat_var[j], "_x_", cat_var[k])]] <- mat[, c] * cat_num1 * cat_num2
+      }
+    }
+  }
+}
+
+
+#All variables (categorical by categorical by continuous by continuous four-way)
+if(length(cont_var) == 2 & length(cat_var) == 2){
+  mat1 <- spline_df[, grep(paste0("^", cont_var[1], "_spline"), colnames(spline_df))]
+  mat2 <- spline_df[, grep(paste0("^", cont_var[2], "_spline"), colnames(spline_df))]
+  cat_num1 <- as.numeric(cat_df[[1]])
+  cat_num2 <- as.numeric(cat_df[[2]])
+  for(c1 in 1:ncol(mat1)){
+    for(c2 in 1:ncol(mat2)){
+      interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2], "_x_", cat_var[1], "_x_", cat_var[2])]] <- mat1[, c1] * mat2[, c2] * cat_num1 * cat_num2
+    }
+  }
+}
+
+X_interactions <- as.data.frame(interaction_list)
+
+#Main spline and all interactions
+X_quanti_full <- cbind(spline_df, X_interactions)
+
+res <- PCAmix(X.quanti = X_quanti_full,
+              X.quali = cat_df,
+              rename.level = TRUE,
+              ndim = 5)
+
+#PC1
+test_Diabetes_df$SVI<-res$ind$coord[,1]
+
+#Rescale
+test_Diabetes_df$SVI_scaled<-(test_Diabetes_df$SVI-min(test_Diabetes_df$SVI))/(max(test_Diabetes_df$SVI)-min(test_Diabetes_df$SVI))
+
+summary(test_Diabetes_df$SVI_scaled)
+hist(test_Diabetes_df$SVI_scaled, main="SVI with all interactions", xlab="SVI (scaled)")
+
+```
+
+```{r}
+#SVI and all variables as linear
+outcome <- "Diabetes_binary"  # assume 0/1 or Yes/No
+svi_var <- "SVI_scaled"
+```
+
+```{r}
+# ---- 1. Histogram + density ----
+p1 <- ggplot(test_Diabetes_df, aes(x = .data[[svi_var]])) +
+  geom_histogram(aes(y = ..density..), binwidth = 0.1, fill="skyblue", color="black", alpha=0.5) +
+  geom_density(color="darkblue", size=1) +
+  theme_minimal() +
+  labs(title="Distribution of SVI", x="SVI_scaled", y="Density")
+print(p1)
+
+# ---- 2. Boxplot by outcome ----
+p2 <- ggplot(test_Diabetes_df, aes(x = factor(.data[[outcome]]), y = .data[[svi_var]])) +
+  geom_boxplot(fill="orange") +
+  theme_minimal() +
+  labs(title="SVI by Diabetes Outcome", x="Diabetes (0/1)", y="SVI_scaled")
+print(p2)
+
+# ---- 3. Density by outcome ----
+p3 <- ggplot(test_Diabetes_df, aes(x = .data[[svi_var]], fill = factor(.data[[outcome]]))) +
+  geom_density(alpha=0.4) +
+  theme_minimal() +
+  labs(title="SVI Density by Diabetes Outcome", x="SVI_scaled", fill="Diabetes")
+print(p3)
+
+# ---- 4. Quartile-based diabetes proportion ----
+test_Diabetes_df <- test_Diabetes_df %>% mutate(SVI_quartile = ntile(.data[[svi_var]], 4))
+p4 <- ggplot(test_Diabetes_df, aes(x = factor(SVI_quartile), y = .data[[outcome]])) +
+  stat_summary(fun = mean, geom = "bar", fill="steelblue") +
+  theme_minimal() +
+  labs(title="Proportion of Diabetes by SVI Quartile",
+       x="SVI Quartile (Q1=lowest, Q4=highest)", y="Proportion with Diabetes")
+print(p4)
+
+# ---- 5. Smooth GAM-style effect plot (optional) ----
+# Only if you have a GAM fitted, e.g., gam_model
+if (exists("gam_model")) {
+  svi_grid <- seq(min(test_Diabetes_df[[svi_var]], na.rm=TRUE), max(test_Diabetes_df[[svi_var]], na.rm=TRUE), length.out=100)
+  newdata <- test_Diabetes_df[rep(1,100),]  # dummy df for prediction
+  newdata[[svi_var]] <- svi_grid
+  
+  pred <- predict(gam_model, newdata=newdata, type="response", se.fit=TRUE)
+  smooth_df <- data.frame(SVI_scaled = svi_grid,
+                          fit = pred$fit,
+                          lower = pred$fit - 1.96*pred$se.fit,
+                          upper = pred$fit + 1.96*pred$se.fit)
+  
+  p5 <- ggplot(smooth_df, aes(x = SVI_scaled, y = fit)) +
+    geom_ribbon(aes(ymin=lower, ymax=upper), alpha=0.2, fill="lightblue") +
+    geom_line(color="blue", size=1) +
+    theme_minimal() +
+    labs(title="GAM Partial Effect of SVI on Diabetes",
+         x="SVI_scaled", y="Predicted Probability")
+  print(p5)
+}
+
+```
+
+
+
+
+
