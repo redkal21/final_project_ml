@@ -9,7 +9,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ```{r}
-setwd("/scratch/nh2696/Machine_Learning/")
+# Use relative path or current working directory
 library(dplyr)
 library(readr)
 one_file <- c("Diabetes_imputed_dataset_1.csv")
@@ -88,8 +88,9 @@ hist(Diabetes_df$SVI_scaled, main="SVI from PC1 (no interactions)", xlab="SVI (s
 interaction_list<-list()
 for (i in 1:(length(cont_var)-1)) {
   for (j in (i+1):length(cont_var)) {
-    mat1 <- spline_list[[i]][, col_has_var_index[sum(sapply(spline_list[1:i], ncol)) - ncol(spline_list[[i]]) + 1 : ncol(spline_list[[i]])], drop=FALSE]
-    mat2 <- spline_list[[j]][, col_has_var_index[sum(sapply(spline_list[1:j], ncol)) - ncol(spline_list[[j]]) + 1 : ncol(spline_list[[j]])], drop=FALSE]
+    # Use spline_df directly instead of complex indexing into spline_list
+    mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df)), drop=FALSE]
+    mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df)), drop=FALSE]
     for (c1 in 1:ncol(mat1)) {
       for (c2 in 1:ncol(mat2)) {
         interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2])]] <- mat1[, c1] * mat2[, c2]
@@ -124,8 +125,8 @@ interaction_list <- list()
 if(length(cont_var) > 1){
   for(i in 1:(length(cont_var)-1)){
     for(j in (i+1):length(cont_var)){
-      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
-      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df))]
+      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df)), drop=FALSE]
+      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df)), drop=FALSE]
       for(c1 in 1:ncol(mat1)){
         for(c2 in 1:ncol(mat2)){
           interaction_list[[paste0(colnames(mat1)[c1], "_x_", colnames(mat2)[c2])]] <- mat1[, c1] * mat2[, c2]
@@ -137,7 +138,7 @@ if(length(cont_var) > 1){
 
 #Continuous by categorical pairwise, Pairwise 2
 for(i in seq_along(cont_var)){
-  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
+  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df)), drop=FALSE]
   for(j in seq_along(cat_var)){
     cat_numeric <- as.numeric(cat_df[[j]])
     for(c in 1:ncol(mat)){
@@ -159,8 +160,8 @@ if(length(cat_var) > 1){
 if(length(cont_var) > 1 & length(cat_var) >= 1){
   for(i in 1:(length(cont_var)-1)){
     for(j in (i+1):length(cont_var)){
-      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
-      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df))]
+      mat1 <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df)), drop=FALSE]
+      mat2 <- spline_df[, grep(paste0("^", cont_var[j], "_spline"), colnames(spline_df)), drop=FALSE]
       for(k in seq_along(cat_var)){
         cat_numeric <- as.numeric(cat_df[[k]])
         for(c1 in 1:ncol(mat1)){
@@ -174,14 +175,16 @@ if(length(cont_var) > 1 & length(cat_var) >= 1){
 }
 
 #Continuous by categorical by categorical three-way comp 2
-for(i in seq_along(cont_var)){
-  mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df))]
-  for(j in 1:(length(cat_var)-1)){
-    for(k in (j+1):length(cat_var)){
-      cat_num1 <- as.numeric(cat_df[[j]])
-      cat_num2 <- as.numeric(cat_df[[k]])
-      for(c in 1:ncol(mat)){
-        interaction_list[[paste0(colnames(mat)[c], "_x_", cat_var[j], "_x_", cat_var[k])]] <- mat[, c] * cat_num1 * cat_num2
+if(length(cat_var) > 1){
+  for(i in seq_along(cont_var)){
+    mat <- spline_df[, grep(paste0("^", cont_var[i], "_spline"), colnames(spline_df)), drop=FALSE]
+    for(j in 1:(length(cat_var)-1)){
+      for(k in (j+1):length(cat_var)){
+        cat_num1 <- as.numeric(cat_df[[j]])
+        cat_num2 <- as.numeric(cat_df[[k]])
+        for(c in 1:ncol(mat)){
+          interaction_list[[paste0(colnames(mat)[c], "_x_", cat_var[j], "_x_", cat_var[k])]] <- mat[, c] * cat_num1 * cat_num2
+        }
       }
     }
   }
@@ -190,8 +193,8 @@ for(i in seq_along(cont_var)){
 
 #All variables (categorical by categorical by continuous by continuous four-way)
 if(length(cont_var) == 2 & length(cat_var) == 2){
-  mat1 <- spline_df[, grep(paste0("^", cont_var[1], "_spline"), colnames(spline_df))]
-  mat2 <- spline_df[, grep(paste0("^", cont_var[2], "_spline"), colnames(spline_df))]
+  mat1 <- spline_df[, grep(paste0("^", cont_var[1], "_spline"), colnames(spline_df)), drop=FALSE]
+  mat2 <- spline_df[, grep(paste0("^", cont_var[2], "_spline"), colnames(spline_df)), drop=FALSE]
   cat_num1 <- as.numeric(cat_df[[1]])
   cat_num2 <- as.numeric(cat_df[[2]])
   for(c1 in 1:ncol(mat1)){
